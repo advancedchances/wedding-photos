@@ -1,22 +1,349 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
-<title>Share Your Photos</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #0f0c29; }
-  body { display: flex; flex-direction: column; }
-  iframe { border: 0; width: 100%; flex: 1; display: block; }
-  .fallback { text-align: center; padding: 8px 16px;
-              font: 13px -apple-system, 'Segoe UI', Roboto, sans-serif; background: #0f0c29; }
-  .fallback a { color: rgba(255,255,255,0.6); }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Share Your Photos</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+      min-height: 100vh;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 420px;
+      width: 100%;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 28px;
+      padding-top: 20px;
+    }
+
+    .header h1 {
+      font-size: 26px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .header p {
+      font-size: 14px;
+      opacity: 0.7;
+    }
+
+    .name-input {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      font-size: 16px;
+      margin-bottom: 16px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .name-input::placeholder { color: rgba(255,255,255,0.4); }
+    .name-input:focus { border-color: rgba(255,255,255,0.4); }
+
+    .upload-zone {
+      border: 2px dashed rgba(255,255,255,0.25);
+      border-radius: 16px;
+      padding: 40px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: rgba(255,255,255,0.04);
+      margin-bottom: 16px;
+    }
+
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: rgba(255,255,255,0.5);
+      background: rgba(255,255,255,0.08);
+    }
+
+    .upload-zone .icon { font-size: 48px; margin-bottom: 12px; }
+    .upload-zone .label { font-size: 16px; font-weight: 600; }
+    .upload-zone .sublabel { font-size: 13px; opacity: 0.5; margin-top: 6px; }
+
+    input[type="file"] { display: none; }
+
+    .preview-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .preview-item {
+      position: relative;
+      border-radius: 10px;
+      overflow: hidden;
+      aspect-ratio: 1;
+    }
+
+    .preview-item img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .preview-item .status-badge {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+    }
+
+    .status-badge.pending { background: rgba(0,0,0,0.5); }
+    .status-badge.uploading { background: #f59e0b; }
+    .status-badge.done { background: #10b981; }
+    .status-badge.error { background: #ef4444; }
+
+    .upload-btn {
+      width: 100%;
+      padding: 16px;
+      border-radius: 12px;
+      border: none;
+      background: #6366f1;
+      color: #fff;
+      font-size: 17px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+
+    .upload-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .upload-btn:not(:disabled):hover { opacity: 0.9; }
+
+    .status-bar {
+      text-align: center;
+      margin-top: 14px;
+      font-size: 14px;
+      opacity: 0.7;
+      min-height: 20px;
+    }
+
+    .done-message {
+      text-align: center;
+      padding: 32px 20px;
+      background: rgba(16, 185, 129, 0.12);
+      border-radius: 16px;
+      margin-top: 16px;
+    }
+
+    .done-message .check { font-size: 48px; margin-bottom: 10px; }
+    .done-message p { font-size: 15px; opacity: 0.8; }
+  </style>
 </head>
 <body>
-  <iframe src="https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec"
-          title="Photo upload" allow="camera"></iframe>
-  <div class="fallback"><a href="https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec" target="_blank" rel="noopener">Page not loading? Tap here</a></div>
+  <div class="container">
+    <div class="header">
+      <h1>Share Your Photos</h1>
+      <p>Tap below to upload photos from this event</p>
+    </div>
+
+    <input class="name-input" id="nameInput" type="text"
+           placeholder="Your name (optional)" autocomplete="name">
+
+    <input class="name-input" id="emailInput" type="email"
+           placeholder="Email to get the full album (optional)" autocomplete="email">
+
+    <div class="upload-zone" id="dropZone">
+      <div class="icon">&#128247;</div>
+      <div class="label">Tap to select photos</div>
+      <div class="sublabel">or take a new one with your camera</div>
+    </div>
+
+    <input type="file" id="fileInput" accept="image/*" multiple>
+
+    <div class="preview-grid" id="previewGrid"></div>
+
+    <button class="upload-btn" id="uploadBtn" disabled>Upload Photos</button>
+
+    <div class="status-bar" id="statusBar"></div>
+  </div>
+
+  <script>
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const previewGrid = document.getElementById('previewGrid');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const statusBar = document.getElementById('statusBar');
+    const nameInput = document.getElementById('nameInput');
+    const emailInput = document.getElementById('emailInput');
+
+    const EXEC_URL = 'https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec';
+
+    async function callScript(payload) {
+      const res = await fetch(EXEC_URL, { method: 'POST', body: JSON.stringify(payload) });
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || 'Upload failed');
+      return json;
+    }
+
+    let selectedFiles = [];
+
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('dragover');
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+      dropZone.classList.remove('dragover');
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      handleFiles(e.dataTransfer.files);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+      handleFiles(e.target.files);
+    });
+
+    function handleFiles(files) {
+      for (const file of files) {
+        if (!file.type.startsWith('image/')) continue;
+        selectedFiles.push({ file, status: 'pending' });
+      }
+      renderPreviews();
+      uploadBtn.disabled = selectedFiles.length === 0;
+      uploadBtn.textContent = `Upload ${selectedFiles.length} Photo${selectedFiles.length !== 1 ? 's' : ''}`;
+    }
+
+    function renderPreviews() {
+      previewGrid.innerHTML = '';
+      selectedFiles.forEach((item, i) => {
+        const div = document.createElement('div');
+        div.className = 'preview-item';
+
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(item.file);
+
+        const badge = document.createElement('div');
+        badge.className = `status-badge ${item.status}`;
+        badge.id = `badge-${i}`;
+        if (item.status === 'done') badge.textContent = '✓';
+        else if (item.status === 'error') badge.textContent = '✗';
+        else if (item.status === 'uploading') badge.textContent = '…';
+
+        div.appendChild(img);
+        div.appendChild(badge);
+        previewGrid.appendChild(div);
+      });
+    }
+
+    function readFileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = reader.result.split(',')[1];
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function compressImage(file, maxDim, quality) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          let w = img.width, h = img.height;
+          if (w > maxDim || h > maxDim) {
+            const ratio = Math.min(maxDim / w, maxDim / h);
+            w = Math.round(w * ratio);
+            h = Math.round(h * ratio);
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/jpeg', quality);
+          resolve(dataUrl.split(',')[1]);
+        };
+        img.onerror = () => reject(new Error('Could not read image'));
+        img.src = URL.createObjectURL(file);
+      });
+    }
+
+    uploadBtn.addEventListener('click', async () => {
+      uploadBtn.disabled = true;
+      const uploaderName = nameInput.value.trim();
+      let uploaded = 0;
+      const total = selectedFiles.length;
+
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const item = selectedFiles[i];
+        item.status = 'uploading';
+        renderPreviews();
+        statusBar.textContent = `Uploading ${i + 1} of ${total}...`;
+
+        try {
+          const base64 = await compressImage(item.file, 2048, 0.85);
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const filename = `photo_${timestamp}_${i}.jpg`;
+
+          await callScript({ action: 'upload', data: base64, filename, name: uploaderName });
+
+          item.status = 'done';
+          uploaded++;
+        } catch (err) {
+          console.error(err);
+          item.status = 'error';
+        }
+        renderPreviews();
+      }
+
+      statusBar.textContent = '';
+      const email = emailInput.value.trim();
+      if (uploaded > 0 && (uploaderName || email)) {
+        callScript({ action: 'log', name: uploaderName, email, count: uploaded }).catch(console.error);
+      }
+      if (uploaded === total) {
+        showDone(uploaded);
+      } else {
+        statusBar.textContent = `${uploaded} of ${total} uploaded. Tap Upload to retry failed ones.`;
+        selectedFiles = selectedFiles.filter(f => f.status === 'error');
+        selectedFiles.forEach(f => f.status = 'pending');
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = `Retry ${selectedFiles.length} Photo${selectedFiles.length !== 1 ? 's' : ''}`;
+      }
+    });
+
+    function showDone(count) {
+      document.querySelector('.container').innerHTML += `
+        <div class="done-message">
+          <div class="check">✅</div>
+          <h2>${count} photo${count !== 1 ? 's' : ''} uploaded!</h2>
+          <p>Thank you for sharing your memories.</p>
+        </div>`;
+    }
+  </script>
 </body>
 </html>
