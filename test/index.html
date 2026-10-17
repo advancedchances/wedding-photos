@@ -203,7 +203,7 @@
     const emailInput = document.getElementById('emailInput');
 
     const EXEC_URL = 'https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec';
-    const CHUNK_SIZE = 16 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
+    const CHUNK_SIZE = 8 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
     const PARALLEL = 3;                 // files uploading at once
     const PHOTO_MAX = 3072;             // long side in px (~7 MP) for large photos
     const PHOTO_QUALITY = 0.9;
@@ -383,8 +383,36 @@
       }
     }
 
-    // Small files go in one request; big ones (videos) go in 16 MB pieces. If a piece fails,
-    // asks Drive how much it already has and carries on from there.
+    async function callWithRetry(payload, tries = 4) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await callScript(payload);
+        } catch (err) {
+          if (attempt >= tries) throw err;
+          await sleep(1500 * attempt);
+        }
+      }
+    }
+
+    // Sends one piece straight to Drive's upload link for this file (no relay, no base64).
+    async function putDirect(uploadUrl, blob, offset, total) {
+      const end = offset + blob.size - 1;
+      const res = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes ${offset}-${end}/${total}` },
+        body: blob
+      });
+      if (res.status === 200 || res.status === 201) return { done: true };
+      if (res.status === 308) {
+        const range = res.headers.get('Range');
+        return { done: false, next: range ? Number(range.split('-')[1]) + 1 : 0 };
+      }
+      throw new Error(`Upload failed (${res.status})`);
+    }
+
+    // Your script opens a Drive upload for the file, then the phone sends it in 8 MB pieces
+    // straight to Drive. If direct sends keep failing, pieces go through the script instead.
+    // After any failure, asks Drive how much it already has and carries on from there.
     async function uploadFile(item, index, uploaderName, onProgress) {
       const original = item.file;
       const fallbackExt = item.video ? '.mp4' : '.jpg';
@@ -403,34 +431,30 @@
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const filename = `${item.video ? 'video' : 'photo'}_${timestamp}_${index}${ext}`;
 
-      if (total <= CHUNK_SIZE) {
-        const data = await readAsBase64(file);
-        for (let attempt = 1; ; attempt++) {
-          try {
-            await callScript({ action: 'upload', data, filename, mimeType, name: uploaderName });
-            return;
-          } catch (err) {
-            if (attempt >= 4) throw err;
-            await sleep(1500 * attempt);
-          }
-        }
-      }
+      if (total === 0) throw new Error('Empty file');
 
-      const { uploadId } = await callScript({ action: 'startUpload', filename, mimeType, size: total, name: uploaderName });
+      const { uploadId, uploadUrl } = await callWithRetry({
+        action: 'startUpload', filename, mimeType, size: total, name: uploaderName
+      });
 
+      let direct = !!uploadUrl;
       let offset = 0;
       let failures = 0;
       while (true) {
         try {
-          const data = await readAsBase64(file.slice(offset, offset + CHUNK_SIZE));
-          const res = await callScript({ action: 'uploadChunk', uploadId, data, offset, total });
+          const piece = file.slice(offset, offset + CHUNK_SIZE);
+          const res = direct
+            ? await putDirect(uploadUrl, piece, offset, total)
+            : await callScript({ action: 'uploadChunk', uploadId, data: await readAsBase64(piece), offset, total });
           if (res.done) return;
           offset = res.next;
           failures = 0;
           onProgress(Math.min(99, Math.floor(offset / total * 100)));
         } catch (err) {
           console.error(err);
-          if (++failures > 5) throw err;
+          failures++;
+          if (failures >= 2) direct = false;
+          if (failures > 6) throw err;
           await sleep(2000 * failures);
           const status = await callScript({ action: 'uploadStatus', uploadId, total }).catch(() => null);
           if (status && status.done) return;
