@@ -155,13 +155,22 @@
 
     .done-message .check { font-size: 48px; margin-bottom: 10px; }
     .done-message p { font-size: 15px; opacity: 0.8; }
+    .preview-item video { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
+    .preview-item .play { position: absolute; left: 6px; bottom: 4px; font-size: 14px; text-shadow: 0 0 4px #000; }
+    .status-badge.uploading.pct { width: auto; padding: 0 6px; border-radius: 11px; font-size: 11px; font-weight: 600; }
+    .keep-open { text-align: center; font-size: 13px; color: #fbbf24; margin-top: 8px; display: none; }
+    .progress { height: 10px; background: rgba(255,255,255,0.12); border-radius: 5px; overflow: hidden; margin-top: 14px; display: none; }
+    .progress-fill { height: 100%; width: 0; background: #10b981; border-radius: 5px; transition: width 0.3s; }
+    .tile-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; background: rgba(0,0,0,0.45); }
+    .tile-bar > div { height: 100%; width: 0; background: #10b981; transition: width 0.3s; }
+    .debug { font: 12px monospace; white-space: pre-wrap; word-break: break-all; margin-top: 12px; opacity: 0.8; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Share Your Photos</h1>
-      <p>Tap below to upload photos from this event</p>
+      <h1>Share Your Photos &amp; Videos</h1>
+      <p>Tap below to upload from this event</p>
     </div>
 
     <input class="name-input" id="nameInput" type="text"
@@ -172,17 +181,21 @@
 
     <div class="upload-zone" id="dropZone">
       <div class="icon">&#128247;</div>
-      <div class="label">Tap to select photos</div>
-      <div class="sublabel">or take a new one with your camera</div>
+      <div class="label">Tap to select photos or videos</div>
+      <div class="sublabel">or take new ones with your camera</div>
     </div>
 
-    <input type="file" id="fileInput" accept="image/*" multiple>
+    <input type="file" id="fileInput" accept="image/*,video/*" multiple>
 
     <div class="preview-grid" id="previewGrid"></div>
 
-    <button class="upload-btn" id="uploadBtn" disabled>Upload Photos</button>
+    <button class="upload-btn" id="uploadBtn" disabled>Upload</button>
 
+    <div class="progress" id="progress"><div class="progress-fill" id="progressFill"></div></div>
     <div class="status-bar" id="statusBar"></div>
+    <div class="keep-open" id="keepOpen">Keep this page open until uploads finish</div>
+    <div id="doneArea"></div>
+    <div class="debug" id="debugOut"></div>
   </div>
 
   <script>
@@ -191,10 +204,27 @@
     const previewGrid = document.getElementById('previewGrid');
     const uploadBtn = document.getElementById('uploadBtn');
     const statusBar = document.getElementById('statusBar');
+    const keepOpen = document.getElementById('keepOpen');
+    const doneArea = document.getElementById('doneArea');
+    const progress = document.getElementById('progress');
+    const progressFill = document.getElementById('progressFill');
+    const debugOut = document.getElementById('debugOut');
+    const DEBUG = /[?&]debug/.test(location.search);
+    const debugLines = [];
+    function debugLog(line) {
+      if (!DEBUG) return;
+      debugLines.push(line);
+      debugOut.textContent = navigator.userAgent + '\n' + debugLines.join('\n');
+    }
     const nameInput = document.getElementById('nameInput');
     const emailInput = document.getElementById('emailInput');
 
     const EXEC_URL = 'https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec';
+    const CHUNK_SIZE = 8 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
+    const PARALLEL = 3;                 // files uploading at once
+    const PHOTO_MAX = 3072;             // long side in px (~7 MP) for large photos
+    const PHOTO_QUALITY = 0.9;
+    const SHRINK_ABOVE = 2.5 * 1024 * 1024; // smaller photos are sent untouched
 
     async function callScript(payload) {
       const res = await fetch(EXEC_URL, { method: 'POST', body: JSON.stringify(payload) });
@@ -224,126 +254,322 @@
 
     fileInput.addEventListener('change', (e) => {
       handleFiles(e.target.files);
+      fileInput.value = '';
     });
 
+    function isVideo(file) {
+      return file.type.startsWith('video/') || /\.(mov|mp4|m4v|3gp|webm|mkv)$/i.test(file.name);
+    }
+
+    function isImage(file) {
+      return file.type.startsWith('image/') || /\.(jpe?g|png|heic|heif|webp|dng)$/i.test(file.name);
+    }
+
     function handleFiles(files) {
+      doneArea.innerHTML = '';
       for (const file of files) {
-        if (!file.type.startsWith('image/')) continue;
-        selectedFiles.push({ file, status: 'pending' });
+        if (!isImage(file) && !isVideo(file)) continue;
+        const item = { file, status: 'pending', video: isVideo(file), url: URL.createObjectURL(file) };
+        selectedFiles.push(item);
+        addPreview(item);
       }
-      renderPreviews();
-      uploadBtn.disabled = selectedFiles.length === 0;
-      uploadBtn.textContent = `Upload ${selectedFiles.length} Photo${selectedFiles.length !== 1 ? 's' : ''}`;
+      updateButton('Upload');
     }
 
-    function renderPreviews() {
-      previewGrid.innerHTML = '';
-      selectedFiles.forEach((item, i) => {
-        const div = document.createElement('div');
-        div.className = 'preview-item';
+    function updateButton(verb) {
+      const n = selectedFiles.length;
+      uploadBtn.disabled = n === 0;
+      uploadBtn.textContent = n ? `${verb} ${n} File${n !== 1 ? 's' : ''}` : 'Upload';
+    }
 
+    function addPreview(item) {
+      const div = document.createElement('div');
+      div.className = 'preview-item';
+      if (item.video) {
+        const v = document.createElement('video');
+        v.src = item.url + '#t=0.1';
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = 'metadata';
+        div.appendChild(v);
+        const play = document.createElement('div');
+        play.className = 'play';
+        play.textContent = '▶';
+        div.appendChild(play);
+      } else {
         const img = document.createElement('img');
-        img.src = URL.createObjectURL(item.file);
-
-        const badge = document.createElement('div');
-        badge.className = `status-badge ${item.status}`;
-        badge.id = `badge-${i}`;
-        if (item.status === 'done') badge.textContent = '✓';
-        else if (item.status === 'error') badge.textContent = '✗';
-        else if (item.status === 'uploading') badge.textContent = '…';
-
+        img.src = item.url;
         div.appendChild(img);
-        div.appendChild(badge);
-        previewGrid.appendChild(div);
-      });
+      }
+      const badge = document.createElement('div');
+      div.appendChild(badge);
+      const bar = document.createElement('div');
+      bar.className = 'tile-bar';
+      bar.appendChild(document.createElement('div'));
+      div.appendChild(bar);
+      item.el = div;
+      item.badge = badge;
+      item.bar = bar.firstChild;
+      setStatus(item, item.status);
+      previewGrid.appendChild(div);
     }
 
-    function readFileAsBase64(file) {
+    function setStatus(item, status, pct) {
+      item.status = status;
+      item.pct = status === 'done' ? 100 : status === 'uploading' ? (pct || 0) : 0;
+      item.bar.style.width = item.pct + '%';
+      updateOverall();
+      const b = item.badge;
+      b.className = `status-badge ${status}`;
+      if (status === 'done') b.textContent = '✓';
+      else if (status === 'error') b.textContent = '✗';
+      else if (status === 'uploading' && pct !== undefined) {
+        b.classList.add('pct');
+        b.textContent = `${pct}%`;
+      } else if (status === 'uploading') b.textContent = '…';
+      else b.textContent = '';
+    }
+
+    function updateOverall() {
+      const totalBytes = selectedFiles.reduce((sum, f) => sum + f.file.size, 0);
+      if (!totalBytes) return;
+      const sentBytes = selectedFiles.reduce((sum, f) => sum + f.file.size * (f.pct || 0) / 100, 0);
+      progressFill.style.width = Math.floor(sentBytes / totalBytes * 100) + '%';
+    }
+
+    function readAsBase64(blob) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = reader.result.split(',')[1];
-          resolve(base64);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = () => reject(new Error('Could not read file'));
+        reader.readAsDataURL(blob);
       });
     }
 
-    function compressImage(file, maxDim, quality) {
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    function loadImage(file) {
       return new Promise((resolve, reject) => {
         const img = new Image();
-        img.onload = () => {
-          let w = img.width, h = img.height;
-          if (w > maxDim || h > maxDim) {
-            const ratio = Math.min(maxDim / w, maxDim / h);
-            w = Math.round(w * ratio);
-            h = Math.round(h * ratio);
-          }
-          const canvas = document.createElement('canvas');
-          canvas.width = w;
-          canvas.height = h;
-          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-          const dataUrl = canvas.toDataURL('image/jpeg', quality);
-          resolve(dataUrl.split(',')[1]);
-        };
-        img.onerror = () => reject(new Error('Could not read image'));
-        img.src = URL.createObjectURL(file);
+        const url = URL.createObjectURL(file);
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not read image')); };
+        img.src = url;
       });
+    }
+
+    // Large photos are resized to PHOTO_MAX at high quality. Returns null to send the original
+    // (small photo, a format the browser can't decode, or no size saving).
+    async function shrinkPhoto(file) {
+      if (file.size <= SHRINK_ABOVE) return null;
+      const img = await loadImage(file);
+      const ratio = Math.min(1, PHOTO_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.naturalWidth * ratio);
+      canvas.height = Math.round(img.naturalHeight * ratio);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      const jpeg = await new Promise(r => canvas.toBlob(r, 'image/jpeg', PHOTO_QUALITY));
+      if (!jpeg || jpeg.size >= file.size) return null;
+      const exif = await readExif(file).catch(() => null);
+      return exif ? new Blob([jpeg.slice(0, 2), exif, jpeg.slice(2)], { type: 'image/jpeg' }) : jpeg;
+    }
+
+    // Copies the original's EXIF block (date taken, camera) so the album sorts by when photos were shot.
+    async function readExif(file) {
+      const bytes = new Uint8Array(await file.slice(0, 256 * 1024).arrayBuffer());
+      if (bytes[0] !== 0xFF || bytes[1] !== 0xD8) return null;
+      let o = 2;
+      while (o + 4 < bytes.length && bytes[o] === 0xFF) {
+        const marker = bytes[o + 1];
+        const len = (bytes[o + 2] << 8) | bytes[o + 3];
+        if (marker === 0xDA) break;
+        if (marker === 0xE1 && String.fromCharCode(...bytes.slice(o + 4, o + 8)) === 'Exif') {
+          if (o + 2 + len > bytes.length) return null;
+          const seg = bytes.slice(o, o + 2 + len);
+          resetOrientation(seg);
+          return seg;
+        }
+        o += 2 + len;
+      }
+      return null;
+    }
+
+    // The resized image is already drawn upright, so the copied EXIF must not rotate it again.
+    function resetOrientation(seg) {
+      const t = 10; // TIFF header: after FF E1, length, "Exif\0\0"
+      const le = seg[t] === 0x49;
+      const u16 = (i) => le ? seg[i] | (seg[i + 1] << 8) : (seg[i] << 8) | seg[i + 1];
+      const u32 = (i) => (le
+        ? seg[i] | (seg[i + 1] << 8) | (seg[i + 2] << 16) | (seg[i + 3] << 24)
+        : (seg[i] << 24) | (seg[i + 1] << 16) | (seg[i + 2] << 8) | seg[i + 3]) >>> 0;
+      const ifd = t + u32(t + 4);
+      if (ifd + 2 > seg.length) return;
+      const count = u16(ifd);
+      for (let k = 0; k < count; k++) {
+        const e = ifd + 2 + k * 12;
+        if (e + 12 > seg.length) return;
+        if (u16(e) === 0x0112) {
+          seg[e + 8] = le ? 1 : 0;
+          seg[e + 9] = le ? 0 : 1;
+        }
+      }
+    }
+
+    async function callWithRetry(payload, tries = 4) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await callScript(payload);
+        } catch (err) {
+          if (attempt >= tries) throw err;
+          await sleep(1500 * attempt);
+        }
+      }
+    }
+
+    // Sends one piece straight to Drive's upload link for this file (no relay, no base64).
+    async function putDirect(uploadUrl, blob, offset, total) {
+      const end = offset + blob.size - 1;
+      const res = await fetch(uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes ${offset}-${end}/${total}` },
+        body: blob
+      });
+      if (res.status === 200 || res.status === 201) return { done: true };
+      if (res.status === 308) {
+        const range = res.headers.get('Range');
+        return { done: false, next: range ? Number(range.split('-')[1]) + 1 : 0 };
+      }
+      throw new Error(`Upload failed (${res.status})`);
+    }
+
+    // Your script opens a Drive upload for the file, then the phone sends it in 8 MB pieces
+    // straight to Drive. If direct sends keep failing, pieces go through the script instead.
+    // After any failure, asks Drive how much it already has and carries on from there.
+    async function uploadFile(item, index, uploaderName, onProgress) {
+      const original = item.file;
+      const fallbackExt = item.video ? '.mp4' : '.jpg';
+      let ext = (original.name.match(/\.[a-z0-9]+$/i) || [fallbackExt])[0].toLowerCase();
+      let mimeType = original.type || (item.video ? 'video/mp4' : 'image/jpeg');
+      let file = original;
+      if (!item.video) {
+        const smaller = await shrinkPhoto(original).catch(() => null);
+        if (smaller) {
+          file = smaller;
+          ext = '.jpg';
+          mimeType = 'image/jpeg';
+        }
+      }
+      const total = file.size;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `${item.video ? 'video' : 'photo'}_${timestamp}_${index}${ext}`;
+
+      if (total === 0) throw new Error('Empty file');
+
+      const { uploadId, uploadUrl } = await callWithRetry({
+        action: 'startUpload', filename, mimeType, size: total, name: uploaderName
+      });
+
+      let direct = !!uploadUrl;
+      let offset = 0;
+      let failures = 0;
+      while (true) {
+        try {
+          const piece = file.slice(offset, offset + CHUNK_SIZE);
+          const res = direct
+            ? await putDirect(uploadUrl, piece, offset, total)
+            : await callScript({ action: 'uploadChunk', uploadId, data: await readAsBase64(piece), offset, total });
+          if (res.done) {
+            debugLog(`${filename}: ${(total / 1048576).toFixed(1)} MB via ${direct ? 'direct' : 'relay'}`);
+            return;
+          }
+          offset = res.next;
+          failures = 0;
+          onProgress(Math.min(99, Math.floor(offset / total * 100)));
+        } catch (err) {
+          console.error(err);
+          debugLog(`${filename}: ${direct ? 'direct' : 'relay'} error at ${offset}: ${err}`);
+          failures++;
+          if (failures >= 2) direct = false;
+          if (failures > 6) throw err;
+          await sleep(2000 * failures);
+          const status = await callScript({ action: 'uploadStatus', uploadId, total }).catch(() => null);
+          if (status && status.done) return;
+          if (status) offset = status.next;
+        }
+      }
+    }
+
+    async function keepScreenOn() {
+      try { return await navigator.wakeLock.request('screen'); } catch (e) { return null; }
     }
 
     uploadBtn.addEventListener('click', async () => {
       uploadBtn.disabled = true;
+      keepOpen.style.display = 'block';
+      const wakeLock = await keepScreenOn();
       const uploaderName = nameInput.value.trim();
-      let uploaded = 0;
       const total = selectedFiles.length;
+      let uploaded = 0;
 
-      for (let i = 0; i < selectedFiles.length; i++) {
-        const item = selectedFiles[i];
-        item.status = 'uploading';
-        renderPreviews();
-        statusBar.textContent = `Uploading ${i + 1} of ${total}...`;
+      let next = 0;
+      let finished = 0;
+      const showProgress = () => {
+        const pct = parseInt(progressFill.style.width) || 0;
+        statusBar.textContent = `Uploading... ${finished} of ${total} done (${pct}%)`;
+      };
+      const ticker = setInterval(showProgress, 500);
+      progress.style.display = 'block';
+      showProgress();
 
-        try {
-          const base64 = await compressImage(item.file, 2048, 0.85);
-          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const filename = `photo_${timestamp}_${i}.jpg`;
-
-          await callScript({ action: 'upload', data: base64, filename, name: uploaderName });
-
-          item.status = 'done';
-          uploaded++;
-        } catch (err) {
-          console.error(err);
-          item.status = 'error';
+      async function worker() {
+        while (next < total) {
+          const i = next++;
+          const item = selectedFiles[i];
+          setStatus(item, 'uploading', item.file.size > CHUNK_SIZE ? 0 : undefined);
+          try {
+            await uploadFile(item, i, uploaderName, (pct) => setStatus(item, 'uploading', pct));
+            setStatus(item, 'done');
+            uploaded++;
+          } catch (err) {
+            console.error(err);
+            setStatus(item, 'error');
+          }
+          finished++;
+          showProgress();
         }
-        renderPreviews();
       }
+      await Promise.all(Array.from({ length: Math.min(PARALLEL, total) }, worker));
 
+      clearInterval(ticker);
+      progress.style.display = 'none';
+      progressFill.style.width = '0';
+      if (wakeLock) wakeLock.release().catch(() => {});
+      keepOpen.style.display = 'none';
       statusBar.textContent = '';
       const email = emailInput.value.trim();
       if (uploaded > 0 && (uploaderName || email)) {
         callScript({ action: 'log', name: uploaderName, email, count: uploaded }).catch(console.error);
       }
-      if (uploaded === total) {
-        showDone(uploaded);
+
+      const failed = selectedFiles.filter(f => f.status === 'error');
+      if (failed.length === 0) {
+        selectedFiles = [];
+        previewGrid.innerHTML = '';
+        updateButton('Upload');
+        doneArea.innerHTML = `
+          <div class="done-message">
+            <div class="check">✅</div>
+            <h2>${uploaded} file${uploaded !== 1 ? 's' : ''} uploaded!</h2>
+            <p>Thank you for sharing your memories. Tap above to add more.</p>
+          </div>`;
       } else {
-        statusBar.textContent = `${uploaded} of ${total} uploaded. Tap Upload to retry failed ones.`;
-        selectedFiles = selectedFiles.filter(f => f.status === 'error');
-        selectedFiles.forEach(f => f.status = 'pending');
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = `Retry ${selectedFiles.length} Photo${selectedFiles.length !== 1 ? 's' : ''}`;
+        statusBar.textContent = `${uploaded} of ${total} uploaded. Tap Retry for the rest.`;
+        selectedFiles.filter(f => f.status === 'done').forEach(f => f.el.remove());
+        selectedFiles = failed;
+        failed.forEach(f => setStatus(f, 'pending'));
+        updateButton('Retry');
       }
     });
-
-    function showDone(count) {
-      document.querySelector('.container').innerHTML += `
-        <div class="done-message">
-          <div class="check">✅</div>
-          <h2>${count} photo${count !== 1 ? 's' : ''} uploaded!</h2>
-          <p>Thank you for sharing your memories.</p>
-        </div>`;
-    }
   </script>
 </body>
 </html>
