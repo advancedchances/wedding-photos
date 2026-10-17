@@ -203,7 +203,7 @@
     const emailInput = document.getElementById('emailInput');
 
     const EXEC_URL = 'https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec';
-    const CHUNK_SIZE = 8 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
+    const CHUNK_SIZE = 16 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
     const PARALLEL = 3;                 // files uploading at once
     const PHOTO_MAX = 3072;             // long side in px (~7 MP) for large photos
     const PHOTO_QUALITY = 0.9;
@@ -383,7 +383,7 @@
       }
     }
 
-    // Small files go in one request; big ones (videos) go in 8 MB pieces. If a piece fails,
+    // Small files go in one request; big ones (videos) go in 16 MB pieces. If a piece fails,
     // asks Drive how much it already has and carries on from there.
     async function uploadFile(item, index, uploaderName, onProgress) {
       const original = item.file;
