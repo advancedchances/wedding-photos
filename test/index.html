@@ -159,6 +159,11 @@
     .preview-item .play { position: absolute; left: 6px; bottom: 4px; font-size: 14px; text-shadow: 0 0 4px #000; }
     .status-badge.uploading.pct { width: auto; padding: 0 6px; border-radius: 11px; font-size: 11px; font-weight: 600; }
     .keep-open { text-align: center; font-size: 13px; color: #fbbf24; margin-top: 8px; display: none; }
+    .progress { height: 10px; background: rgba(255,255,255,0.12); border-radius: 5px; overflow: hidden; margin-top: 14px; display: none; }
+    .progress-fill { height: 100%; width: 0; background: #10b981; border-radius: 5px; transition: width 0.3s; }
+    .tile-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; background: rgba(0,0,0,0.45); }
+    .tile-bar > div { height: 100%; width: 0; background: #10b981; transition: width 0.3s; }
+    .debug { font: 12px monospace; white-space: pre-wrap; word-break: break-all; margin-top: 12px; opacity: 0.8; }
   </style>
 </head>
 <body>
@@ -186,9 +191,11 @@
 
     <button class="upload-btn" id="uploadBtn" disabled>Upload</button>
 
+    <div class="progress" id="progress"><div class="progress-fill" id="progressFill"></div></div>
     <div class="status-bar" id="statusBar"></div>
     <div class="keep-open" id="keepOpen">Keep this page open until uploads finish</div>
     <div id="doneArea"></div>
+    <div class="debug" id="debugOut"></div>
   </div>
 
   <script>
@@ -199,6 +206,16 @@
     const statusBar = document.getElementById('statusBar');
     const keepOpen = document.getElementById('keepOpen');
     const doneArea = document.getElementById('doneArea');
+    const progress = document.getElementById('progress');
+    const progressFill = document.getElementById('progressFill');
+    const debugOut = document.getElementById('debugOut');
+    const DEBUG = /[?&]debug/.test(location.search);
+    const debugLines = [];
+    function debugLog(line) {
+      if (!DEBUG) return;
+      debugLines.push(line);
+      debugOut.textContent = navigator.userAgent + '\n' + debugLines.join('\n');
+    }
     const nameInput = document.getElementById('nameInput');
     const emailInput = document.getElementById('emailInput');
 
@@ -286,14 +303,22 @@
       }
       const badge = document.createElement('div');
       div.appendChild(badge);
+      const bar = document.createElement('div');
+      bar.className = 'tile-bar';
+      bar.appendChild(document.createElement('div'));
+      div.appendChild(bar);
       item.el = div;
       item.badge = badge;
+      item.bar = bar.firstChild;
       setStatus(item, item.status);
       previewGrid.appendChild(div);
     }
 
     function setStatus(item, status, pct) {
       item.status = status;
+      item.pct = status === 'done' ? 100 : status === 'uploading' ? (pct || 0) : 0;
+      item.bar.style.width = item.pct + '%';
+      updateOverall();
       const b = item.badge;
       b.className = `status-badge ${status}`;
       if (status === 'done') b.textContent = '✓';
@@ -303,6 +328,13 @@
         b.textContent = `${pct}%`;
       } else if (status === 'uploading') b.textContent = '…';
       else b.textContent = '';
+    }
+
+    function updateOverall() {
+      const totalBytes = selectedFiles.reduce((sum, f) => sum + f.file.size, 0);
+      if (!totalBytes) return;
+      const sentBytes = selectedFiles.reduce((sum, f) => sum + f.file.size * (f.pct || 0) / 100, 0);
+      progressFill.style.width = Math.floor(sentBytes / totalBytes * 100) + '%';
     }
 
     function readAsBase64(blob) {
@@ -446,12 +478,16 @@
           const res = direct
             ? await putDirect(uploadUrl, piece, offset, total)
             : await callScript({ action: 'uploadChunk', uploadId, data: await readAsBase64(piece), offset, total });
-          if (res.done) return;
+          if (res.done) {
+            debugLog(`${filename}: ${(total / 1048576).toFixed(1)} MB via ${direct ? 'direct' : 'relay'}`);
+            return;
+          }
           offset = res.next;
           failures = 0;
           onProgress(Math.min(99, Math.floor(offset / total * 100)));
         } catch (err) {
           console.error(err);
+          debugLog(`${filename}: ${direct ? 'direct' : 'relay'} error at ${offset}: ${err}`);
           failures++;
           if (failures >= 2) direct = false;
           if (failures > 6) throw err;
@@ -478,8 +514,11 @@
       let next = 0;
       let finished = 0;
       const showProgress = () => {
-        statusBar.textContent = `Uploading... ${finished} of ${total} done`;
+        const pct = parseInt(progressFill.style.width) || 0;
+        statusBar.textContent = `Uploading... ${finished} of ${total} done (${pct}%)`;
       };
+      const ticker = setInterval(showProgress, 500);
+      progress.style.display = 'block';
       showProgress();
 
       async function worker() {
@@ -501,6 +540,9 @@
       }
       await Promise.all(Array.from({ length: Math.min(PARALLEL, total) }, worker));
 
+      clearInterval(ticker);
+      progress.style.display = 'none';
+      progressFill.style.width = '0';
       if (wakeLock) wakeLock.release().catch(() => {});
       keepOpen.style.display = 'none';
       statusBar.textContent = '';
