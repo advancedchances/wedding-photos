@@ -560,7 +560,7 @@
           <div class="done-message">
             <div class="check">✅</div>
             <h2>${uploaded} file${uploaded !== 1 ? 's' : ''} uploaded!</h2>
-            <p>Thank you for sharing your memories. Tap above to add more.</p>
+            <p>Thank you for sharing your memories!${email ? " We'll email you the full album after the wedding." : ''} Tap above to add more.</p>
           </div>`;
       } else {
         statusBar.textContent = `${uploaded} of ${total} uploaded. Tap Retry for the rest.`;
