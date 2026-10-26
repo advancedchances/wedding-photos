@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>Share Your Photos</title>
+  <script>
+    // Anyone landing on http:// (a typed address) goes to the secure page, which uploads need.
+    if (location.protocol === 'http:') {
+      location.replace('https://' + location.host + location.pathname + location.search);
+    }
+  </script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -164,6 +170,9 @@
     .tile-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; background: rgba(0,0,0,0.45); }
     .tile-bar > div { height: 100%; width: 0; background: #10b981; transition: width 0.3s; }
     .debug { font: 12px monospace; white-space: pre-wrap; word-break: break-all; margin-top: 12px; opacity: 0.8; }
+    .notice { display: none; background: rgba(251,191,36,0.14); border: 1px solid rgba(251,191,36,0.5); color: #fde68a; border-radius: 12px; padding: 12px 14px; font-size: 14px; line-height: 1.4; margin-bottom: 16px; }
+    .status-bar.warn { color: #fbbf24; opacity: 1; }
+    #retryBtn { display: none; margin-top: 14px; }
   </style>
 </head>
 <body>
@@ -171,6 +180,11 @@
     <div class="header">
       <h1>Share Your Photos &amp; Videos</h1>
       <p>Tap below to upload from this event</p>
+    </div>
+
+    <div class="notice" id="inAppNotice">
+      This page is open inside another app, where uploads often don't work.
+      Tap <b>&middot;&middot;&middot;</b> or the share icon and choose <b>Open in Safari</b> or <b>Open in Chrome</b>.
     </div>
 
     <input class="name-input" id="nameInput" type="text"
@@ -182,18 +196,17 @@
     <div class="upload-zone" id="dropZone">
       <div class="icon">&#128247;</div>
       <div class="label">Tap to select photos or videos</div>
-      <div class="sublabel">or take new ones with your camera</div>
+      <div class="sublabel">Uploading starts as soon as you pick</div>
     </div>
 
     <input type="file" id="fileInput" accept="image/*,video/*" multiple>
 
     <div class="preview-grid" id="previewGrid"></div>
 
-    <button class="upload-btn" id="uploadBtn" disabled>Upload</button>
-
     <div class="progress" id="progress"><div class="progress-fill" id="progressFill"></div></div>
     <div class="status-bar" id="statusBar"></div>
     <div class="keep-open" id="keepOpen">Keep this page open until uploads finish</div>
+    <button class="upload-btn" id="retryBtn">Retry</button>
     <div id="doneArea"></div>
     <div class="debug" id="debugOut"></div>
   </div>
@@ -202,13 +215,15 @@
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
     const previewGrid = document.getElementById('previewGrid');
-    const uploadBtn = document.getElementById('uploadBtn');
+    const retryBtn = document.getElementById('retryBtn');
     const statusBar = document.getElementById('statusBar');
     const keepOpen = document.getElementById('keepOpen');
     const doneArea = document.getElementById('doneArea');
     const progress = document.getElementById('progress');
     const progressFill = document.getElementById('progressFill');
     const debugOut = document.getElementById('debugOut');
+    const nameInput = document.getElementById('nameInput');
+    const emailInput = document.getElementById('emailInput');
     const DEBUG = /[?&]debug/.test(location.search);
     const debugLines = [];
     function debugLog(line) {
@@ -216,24 +231,72 @@
       debugLines.push(line);
       debugOut.textContent = navigator.userAgent + '\n' + debugLines.join('\n');
     }
-    const nameInput = document.getElementById('nameInput');
-    const emailInput = document.getElementById('emailInput');
 
     const EXEC_URL = 'https://script.google.com/macros/s/AKfycbyjiLTzGf8XIfjN4K3-YtCHS1GlVDkFH_1WxAG30GiBGQzSXPge2AElDuMlpPegq9fP/exec';
-    const CHUNK_SIZE = 8 * 1024 * 1024; // Drive needs pieces in multiples of 256 KB
+    const MAX_CHUNK = 4 * 1024 * 1024;  // Drive needs pieces in multiples of 256 KB
+    const MIN_CHUNK = 256 * 1024;
     const PARALLEL = 3;                 // files uploading at once
+    const STALL_MS = 30000;             // no bytes moving this long = stalled connection, retry
+    const SCRIPT_TIMEOUT_MS = 45000;
+    const MAX_FAILURES = 8;             // in a row, before a file shows Retry
     const PHOTO_MAX = 3072;             // long side in px (~7 MP) for large photos
     const PHOTO_QUALITY = 0.9;
     const SHRINK_ABOVE = 2.5 * 1024 * 1024; // smaller photos are sent untouched
 
-    async function callScript(payload) {
-      const res = await fetch(EXEC_URL, { method: 'POST', body: JSON.stringify(payload) });
-      const json = await res.json();
-      if (!json.success) throw new Error(json.error || 'Upload failed');
-      return json;
+    // Pages opened inside Instagram, Facebook, Snapchat, TikTok or a scanner app's built-in
+    // browser often can't pick or upload files.
+    if (/Instagram|FBAN|FBAV|FB_IAB|Snapchat|Line\/|musical_ly|BytedanceWebview|Pinterest|; wv\)/i.test(navigator.userAgent)) {
+      document.getElementById('inAppNotice').style.display = 'block';
     }
 
-    let selectedFiles = [];
+    class UploadError extends Error {
+      constructor(kind, status) {
+        super(kind + (status ? ' ' + status : ''));
+        this.kind = kind;
+      }
+    }
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    async function callScript(payload, timeoutMs = SCRIPT_TIMEOUT_MS) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(EXEC_URL, { method: 'POST', body: JSON.stringify(payload), signal: ctrl.signal });
+        const json = await res.json();
+        if (!json.success) throw new Error(json.error || 'Upload failed');
+        return json;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function callWithRetry(payload, tries = 5) {
+      for (let attempt = 1; ; attempt++) {
+        await waitForOnline();
+        try {
+          return await callScript(payload);
+        } catch (err) {
+          if (attempt >= tries) throw err;
+          setNote('Weak connection, retrying... keep this page open');
+          await sleep(2000 * attempt);
+        }
+      }
+    }
+
+    let note = '';
+    function setNote(text) { note = text; refresh(); }
+    function clearNote() { if (note) { note = ''; refresh(); } }
+
+    function waitForOnline() {
+      if (navigator.onLine !== false) return Promise.resolve();
+      setNote("You're offline. Uploads will continue when you're back online.");
+      return new Promise(r => window.addEventListener('online', () => { clearNote(); r(); }, { once: true }));
+    }
+
+    let items = [];
+    let active = 0;
+    let wakeLock = null;
 
     dropZone.addEventListener('click', () => fileInput.click());
 
@@ -257,6 +320,29 @@
       fileInput.value = '';
     });
 
+    // Retry resumes each failed file where it stopped, trying the fast direct route again first.
+    retryBtn.addEventListener('click', () => {
+      items.filter(i => i.status === 'error').forEach(i => {
+        if (i.session) {
+          i.direct = !!i.session.uploadUrl;
+          i.chunk = MAX_CHUNK;
+        }
+        setStatus(i, 'pending');
+      });
+      pump();
+    });
+
+    window.addEventListener('beforeunload', (e) => {
+      if (active > 0) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (active > 0 && document.visibilityState === 'visible') keepScreenOn();
+    });
+
     function isVideo(file) {
       return file.type.startsWith('video/') || /\.(mov|mp4|m4v|3gp|webm|mkv)$/i.test(file.name);
     }
@@ -265,21 +351,16 @@
       return file.type.startsWith('image/') || /\.(jpe?g|png|heic|heif|webp|dng)$/i.test(file.name);
     }
 
+    // Picking files starts uploading right away; picking more while busy adds them to the queue.
     function handleFiles(files) {
       doneArea.innerHTML = '';
       for (const file of files) {
         if (!isImage(file) && !isVideo(file)) continue;
-        const item = { file, status: 'pending', video: isVideo(file), url: URL.createObjectURL(file) };
-        selectedFiles.push(item);
+        const item = { file, status: 'pending', video: isVideo(file), url: URL.createObjectURL(file), fraction: 0 };
+        items.push(item);
         addPreview(item);
       }
-      updateButton('Upload');
-    }
-
-    function updateButton(verb) {
-      const n = selectedFiles.length;
-      uploadBtn.disabled = n === 0;
-      uploadBtn.textContent = n ? `${verb} ${n} File${n !== 1 ? 's' : ''}` : 'Upload';
+      pump();
     }
 
     function addPreview(item) {
@@ -316,9 +397,10 @@
 
     function setStatus(item, status, pct) {
       item.status = status;
-      item.pct = status === 'done' ? 100 : status === 'uploading' ? (pct || 0) : 0;
-      item.bar.style.width = item.pct + '%';
-      updateOverall();
+      if (status === 'done') item.fraction = 1;
+      else if (status === 'uploading' && pct !== undefined) item.fraction = pct / 100;
+      else if (status !== 'uploading') item.fraction = 0;
+      item.bar.style.width = Math.floor(item.fraction * 100) + '%';
       const b = item.badge;
       b.className = `status-badge ${status}`;
       if (status === 'done') b.textContent = '✓';
@@ -328,13 +410,87 @@
         b.textContent = `${pct}%`;
       } else if (status === 'uploading') b.textContent = '…';
       else b.textContent = '';
+      refresh();
     }
 
-    function updateOverall() {
-      const totalBytes = selectedFiles.reduce((sum, f) => sum + f.file.size, 0);
-      if (!totalBytes) return;
-      const sentBytes = selectedFiles.reduce((sum, f) => sum + f.file.size * (f.pct || 0) / 100, 0);
-      progressFill.style.width = Math.floor(sentBytes / totalBytes * 100) + '%';
+    function refresh() {
+      const totalBytes = items.reduce((sum, i) => sum + i.file.size, 0);
+      const sentBytes = items.reduce((sum, i) => sum + i.file.size * i.fraction, 0);
+      const pct = totalBytes ? Math.floor(sentBytes / totalBytes * 100) : 0;
+      progressFill.style.width = pct + '%';
+      if (active > 0) {
+        const finished = items.filter(i => i.status === 'done' || i.status === 'error').length;
+        statusBar.textContent = note || `Uploading... ${finished} of ${items.length} done (${pct}%)`;
+        statusBar.classList.toggle('warn', !!note);
+      }
+    }
+
+    async function keepScreenOn() {
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { wakeLock = null; }
+    }
+
+    function pump() {
+      while (active < PARALLEL) {
+        const item = items.find(i => i.status === 'pending');
+        if (!item) break;
+        runItem(item);
+      }
+    }
+
+    async function runItem(item) {
+      if (active++ === 0) {
+        retryBtn.style.display = 'none';
+        keepOpen.style.display = 'block';
+        progress.style.display = 'block';
+        keepScreenOn();
+      }
+      setStatus(item, 'uploading', 0);
+      try {
+        await uploadFile(item, (fraction) => setStatus(item, 'uploading', Math.min(99, Math.floor(fraction * 100))));
+        setStatus(item, 'done');
+      } catch (err) {
+        console.error(err);
+        debugLog(`${item.file.name}: gave up: ${err}`);
+        setStatus(item, 'error');
+      }
+      active--;
+      if (items.some(i => i.status === 'pending')) pump();
+      else if (active === 0) finishBatch();
+    }
+
+    function finishBatch() {
+      if (wakeLock) wakeLock.release().catch(() => {});
+      wakeLock = null;
+      note = '';
+      keepOpen.style.display = 'none';
+      progress.style.display = 'none';
+      statusBar.classList.remove('warn');
+      const uploaderName = nameInput.value.trim();
+      const email = emailInput.value.trim();
+      const done = items.filter(i => i.status === 'done');
+      const newlyDone = done.filter(i => !i.logged);
+      newlyDone.forEach(i => { i.logged = true; });
+      if (newlyDone.length > 0 && (uploaderName || email)) {
+        callWithRetry({ action: 'log', name: uploaderName, email, count: newlyDone.length }).catch(console.error);
+      }
+
+      const failed = items.filter(i => i.status === 'error');
+      if (failed.length === 0) {
+        statusBar.textContent = '';
+        items = [];
+        previewGrid.innerHTML = '';
+        doneArea.innerHTML = `
+          <div class="done-message">
+            <div class="check">✅</div>
+            <h2>${done.length} file${done.length !== 1 ? 's' : ''} uploaded!</h2>
+            <p>Thank you for sharing your memories!${email ? " We'll email you the full album after the wedding." : ''} Tap above to add more.</p>
+          </div>`;
+      } else {
+        statusBar.textContent = `${done.length} of ${items.length} uploaded. Check your signal, then tap Retry. Finished files are saved.`;
+        statusBar.classList.add('warn');
+        retryBtn.textContent = `Retry ${failed.length} File${failed.length !== 1 ? 's' : ''}`;
+        retryBtn.style.display = 'block';
+      }
     }
 
     function readAsBase64(blob) {
@@ -345,8 +501,6 @@
         reader.readAsDataURL(blob);
       });
     }
-
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     function loadImage(file) {
       return new Promise((resolve, reject) => {
@@ -415,37 +569,9 @@
       }
     }
 
-    async function callWithRetry(payload, tries = 4) {
-      for (let attempt = 1; ; attempt++) {
-        try {
-          return await callScript(payload);
-        } catch (err) {
-          if (attempt >= tries) throw err;
-          await sleep(1500 * attempt);
-        }
-      }
-    }
-
-    // Sends one piece straight to Drive's upload link for this file (no relay, no base64).
-    async function putDirect(uploadUrl, blob, offset, total) {
-      const end = offset + blob.size - 1;
-      const res = await fetch(uploadUrl, {
-        method: 'PUT',
-        headers: { 'Content-Range': `bytes ${offset}-${end}/${total}` },
-        body: blob
-      });
-      if (res.status === 200 || res.status === 201) return { done: true };
-      if (res.status === 308) {
-        const range = res.headers.get('Range');
-        return { done: false, next: range ? Number(range.split('-')[1]) + 1 : 0 };
-      }
-      throw new Error(`Upload failed (${res.status})`);
-    }
-
-    // Your script opens a Drive upload for the file, then the phone sends it in 8 MB pieces
-    // straight to Drive. If direct sends keep failing, pieces go through the script instead.
-    // After any failure, asks Drive how much it already has and carries on from there.
-    async function uploadFile(item, index, uploaderName, onProgress) {
+    // Done once per file, so a Retry resumes the same upload instead of starting over.
+    async function prepareFile(item) {
+      if (item.prepared) return item.prepared;
       const original = item.file;
       const fallbackExt = item.video ? '.mp4' : '.jpg';
       let ext = (original.name.match(/\.[a-z0-9]+$/i) || [fallbackExt])[0].toLowerCase();
@@ -459,117 +585,113 @@
           mimeType = 'image/jpeg';
         }
       }
-      const total = file.size;
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const index = items.indexOf(item);
       const filename = `${item.video ? 'video' : 'photo'}_${timestamp}_${index}${ext}`;
+      item.prepared = { file, filename, mimeType };
+      return item.prepared;
+    }
 
+    async function openSession(item) {
+      const { file, filename, mimeType } = item.prepared;
+      item.session = await callWithRetry({
+        action: 'startUpload', filename, mimeType, size: file.size, name: nameInput.value.trim()
+      });
+      item.offset = 0;
+      item.direct = !!item.session.uploadUrl;
+      item.chunk = MAX_CHUNK;
+    }
+
+    // Sends one piece straight to Drive's upload link (no relay, no base64), reporting bytes as
+    // they go. Aborts if nothing moves for STALL_MS so a dead connection retries instead of hanging.
+    function putDirect(uploadUrl, blob, offset, total, onBytes) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let lastActivity = Date.now();
+        let settled = false;
+        const finish = (err, value) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(watchdog);
+          if (err) reject(err); else resolve(value);
+        };
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastActivity > STALL_MS) {
+            xhr.abort();
+            finish(new UploadError('stall'));
+          }
+        }, 2000);
+        xhr.open('PUT', uploadUrl);
+        xhr.setRequestHeader('Content-Range', `bytes ${offset}-${offset + blob.size - 1}/${total}`);
+        xhr.upload.onprogress = (e) => { lastActivity = Date.now(); onBytes(e.loaded); };
+        xhr.upload.onload = () => { lastActivity = Date.now(); };
+        xhr.onload = () => {
+          if (xhr.status === 200 || xhr.status === 201) return finish(null, { done: true });
+          if (xhr.status === 308) {
+            const range = xhr.getResponseHeader('Range');
+            return finish(null, { done: false, next: range ? Number(range.split('-')[1]) + 1 : 0 });
+          }
+          finish(new UploadError(xhr.status === 404 || xhr.status === 410 ? 'expired' : 'http', xhr.status));
+        };
+        xhr.onerror = () => finish(new UploadError('network'));
+        xhr.onabort = () => finish(new UploadError('stall'));
+        xhr.send(blob);
+      });
+    }
+
+    // Your script opens a Drive upload for the file, then the phone sends it in pieces straight
+    // to Drive. A stalled piece is retried smaller; repeated network errors switch to sending
+    // through the script. After any failure, asks Drive how much it has and carries on from there.
+    async function uploadFile(item, onProgress) {
+      const { file, filename } = await prepareFile(item);
+      const total = file.size;
       if (total === 0) throw new Error('Empty file');
 
-      const { uploadId, uploadUrl } = await callWithRetry({
-        action: 'startUpload', filename, mimeType, size: total, name: uploaderName
-      });
+      if (!item.session) {
+        await openSession(item);
+      } else {
+        const status = await callScript({ action: 'uploadStatus', uploadId: item.session.uploadId, total }).catch(() => null);
+        if (status && status.done) return;
+        if (status) item.offset = status.next;
+      }
 
-      let direct = !!uploadUrl;
-      let offset = 0;
       let failures = 0;
       while (true) {
+        await waitForOnline();
+        const offset = item.offset;
+        const piece = file.slice(offset, offset + item.chunk);
         try {
-          const piece = file.slice(offset, offset + CHUNK_SIZE);
-          const res = direct
-            ? await putDirect(uploadUrl, piece, offset, total)
-            : await callScript({ action: 'uploadChunk', uploadId, data: await readAsBase64(piece), offset, total });
+          const res = item.direct
+            ? await putDirect(item.session.uploadUrl, piece, offset, total, (sent) => onProgress((offset + sent) / total))
+            : await callScript({ action: 'uploadChunk', uploadId: item.session.uploadId, data: await readAsBase64(piece), offset, total }, 120000);
           if (res.done) {
-            debugLog(`${filename}: ${(total / 1048576).toFixed(1)} MB via ${direct ? 'direct' : 'relay'}`);
+            debugLog(`${filename}: ${(total / 1048576).toFixed(1)} MB via ${item.direct ? 'direct' : 'relay'}`);
             return;
           }
-          offset = res.next;
+          item.offset = res.next;
           failures = 0;
-          onProgress(Math.min(99, Math.floor(offset / total * 100)));
+          if (item.chunk < MAX_CHUNK) item.chunk *= 2;
+          clearNote();
+          onProgress(item.offset / total);
         } catch (err) {
           console.error(err);
-          debugLog(`${filename}: ${direct ? 'direct' : 'relay'} error at ${offset}: ${err}`);
           failures++;
-          if (failures >= 2) direct = false;
-          if (failures > 6) throw err;
-          await sleep(2000 * failures);
-          const status = await callScript({ action: 'uploadStatus', uploadId, total }).catch(() => null);
-          if (status && status.done) return;
-          if (status) offset = status.next;
-        }
-      }
-    }
-
-    async function keepScreenOn() {
-      try { return await navigator.wakeLock.request('screen'); } catch (e) { return null; }
-    }
-
-    uploadBtn.addEventListener('click', async () => {
-      uploadBtn.disabled = true;
-      keepOpen.style.display = 'block';
-      const wakeLock = await keepScreenOn();
-      const uploaderName = nameInput.value.trim();
-      const total = selectedFiles.length;
-      let uploaded = 0;
-
-      let next = 0;
-      let finished = 0;
-      const showProgress = () => {
-        const pct = parseInt(progressFill.style.width) || 0;
-        statusBar.textContent = `Uploading... ${finished} of ${total} done (${pct}%)`;
-      };
-      const ticker = setInterval(showProgress, 500);
-      progress.style.display = 'block';
-      showProgress();
-
-      async function worker() {
-        while (next < total) {
-          const i = next++;
-          const item = selectedFiles[i];
-          setStatus(item, 'uploading', item.file.size > CHUNK_SIZE ? 0 : undefined);
-          try {
-            await uploadFile(item, i, uploaderName, (pct) => setStatus(item, 'uploading', pct));
-            setStatus(item, 'done');
-            uploaded++;
-          } catch (err) {
-            console.error(err);
-            setStatus(item, 'error');
+          debugLog(`${filename}: ${item.direct ? 'direct' : 'relay'} ${err.kind || err.name} at ${offset}, piece ${item.chunk / 1024} KB`);
+          if (err.kind === 'expired') {
+            await openSession(item);
+            continue;
           }
-          finished++;
-          showProgress();
+          if (err.kind === 'stall' || err.name === 'AbortError') item.chunk = Math.max(MIN_CHUNK, item.chunk / 2);
+          if (err.kind === 'network' && failures >= 2 && navigator.onLine !== false) item.direct = false;
+          if (failures >= MAX_FAILURES) throw err;
+          setNote('Weak connection, retrying... keep this page open');
+          await sleep(Math.min(2000 * failures, 15000));
+          const status = await callScript({ action: 'uploadStatus', uploadId: item.session.uploadId, total }).catch(() => null);
+          if (status && status.done) return;
+          if (status) item.offset = status.next;
         }
       }
-      await Promise.all(Array.from({ length: Math.min(PARALLEL, total) }, worker));
-
-      clearInterval(ticker);
-      progress.style.display = 'none';
-      progressFill.style.width = '0';
-      if (wakeLock) wakeLock.release().catch(() => {});
-      keepOpen.style.display = 'none';
-      statusBar.textContent = '';
-      const email = emailInput.value.trim();
-      if (uploaded > 0 && (uploaderName || email)) {
-        callScript({ action: 'log', name: uploaderName, email, count: uploaded }).catch(console.error);
-      }
-
-      const failed = selectedFiles.filter(f => f.status === 'error');
-      if (failed.length === 0) {
-        selectedFiles = [];
-        previewGrid.innerHTML = '';
-        updateButton('Upload');
-        doneArea.innerHTML = `
-          <div class="done-message">
-            <div class="check">✅</div>
-            <h2>${uploaded} file${uploaded !== 1 ? 's' : ''} uploaded!</h2>
-            <p>Thank you for sharing your memories!${email ? " We'll email you the full album after the wedding." : ''} Tap above to add more.</p>
-          </div>`;
-      } else {
-        statusBar.textContent = `${uploaded} of ${total} uploaded. Tap Retry for the rest.`;
-        selectedFiles.filter(f => f.status === 'done').forEach(f => f.el.remove());
-        selectedFiles = failed;
-        failed.forEach(f => setStatus(f, 'pending'));
-        updateButton('Retry');
-      }
-    });
+    }
   </script>
 </body>
 </html>
